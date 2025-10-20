@@ -259,8 +259,4 @@ whoami
 
 ---
 
-If you want, I can:
-- produce a shorter README suitable for a GitHub repository front page, or
-- create a release-friendly "cheat-sheet" with only commands and minimal explanation for quick reproduction.
-
-Happy to make a second pass and tailor the writeup to the tone/length you prefer.
+Thank you for reading my walkthrough.
